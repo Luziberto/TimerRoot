@@ -651,8 +651,7 @@ public class MainActivity extends Activity {
                     return;
                 }
                 String out = service.openRoot();
-                rootOpen = out.contains("uid=0(root)")
-                        || (out.contains("setuid(0)=0") && out.contains("resuid=0/0/"));
+                rootOpen = RootLog.shellConfirmed(out);
                 addLog(out);
                 ui.post(this::applyDetails);
                 if (!rootOpen) {
