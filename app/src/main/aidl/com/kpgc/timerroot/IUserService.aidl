@@ -12,4 +12,7 @@ interface IUserService {
     String closeRoot() = 8;
     String info() = 9;
     String rebootDevice() = 10;
+    String installFromBytes(in byte[] payload) = 11;
+    /** seq 0 starts dest+".new"; last chunk chmod 755 and renames onto dest. */
+    String installFileChunk(String dest, int seq, in byte[] chunk, boolean last) = 12;
 }

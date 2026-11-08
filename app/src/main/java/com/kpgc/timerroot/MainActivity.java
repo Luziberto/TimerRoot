@@ -25,6 +25,8 @@ import android.widget.ScrollView;
 import android.widget.Toast;
 import android.widget.TextView;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
@@ -42,6 +44,10 @@ public class MainActivity extends Activity {
 
     private static final String TAG = "TimerRoot";
     private static final int REQUEST_CODE = 1001;
+    /** Same path the exploit script uses before printing "[ksu] ksud missing". */
+    private static final String TIMER_PATH = "/data/local/tmp/timer";
+    private static final String KSUD_PATH = "/data/local/tmp/ksud";
+    private static final int ASSET_CHUNK = 256 * 1024;
 
     private static final int BG = 0xFF0B0B0B;
     private static final int CARD = 0xFF1C1C1E;
@@ -543,10 +549,12 @@ public class MainActivity extends Activity {
         toast("Preparing...");
         new Thread(() -> {
             try {
-                final String result = service.install(getPackageCodePath());
+                final String timer = installAsset("timer", TIMER_PATH);
+                final String ksud = installAsset("ksud", KSUD_PATH);
+                final String result = timer + "\n" + ksud;
                 addLog(result);
                 ui.post(() -> {
-                    toast(result);
+                    toast(timer);
                     refreshDetails();
                 });
             } catch (Throwable t) {
@@ -554,6 +562,65 @@ public class MainActivity extends Activity {
                 ui.post(() -> toast("prepare failed: " + t));
             }
         }).start();
+    }
+
+    /** Reads an asset in the app process and writes it via the shell user service. */
+    private String installAsset(String assetName, String dest) throws Exception {
+        if (service == null) {
+            return "service not bound";
+        }
+        byte[] data = readAsset(assetName);
+        addLog("assets/" + assetName + ": " + data.length + " bytes -> " + dest);
+        String result = "install failed: empty " + assetName;
+        int seq = 0;
+        for (int off = 0; off < data.length; off += ASSET_CHUNK) {
+            int n = Math.min(ASSET_CHUNK, data.length - off);
+            byte[] part = new byte[n];
+            System.arraycopy(data, off, part, 0, n);
+            boolean last = off + n >= data.length;
+            result = service.installFileChunk(dest, seq, part, last);
+            if (result != null && result.startsWith("install failed")) {
+                return result;
+            }
+            seq = 1;
+        }
+        return result;
+    }
+
+    private byte[] readAsset(String assetName) throws Exception {
+        try (InputStream in = getAssets().open(assetName);
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            byte[] data = out.toByteArray();
+            if (data.length < 1024) {
+                throw new IllegalStateException("assets/" + assetName
+                        + " too small (" + data.length + " bytes)");
+            }
+            return data;
+        }
+    }
+
+    private boolean installTimerIfNeeded() {
+        return installNamed("timer", TIMER_PATH);
+    }
+
+    private boolean installKsudIfNeeded() {
+        return installNamed("ksud", KSUD_PATH);
+    }
+
+    private boolean installNamed(String assetName, String dest) {
+        try {
+            String result = installAsset(assetName, dest);
+            addLog(result);
+            return result != null && result.startsWith("installed ");
+        } catch (Throwable t) {
+            addLog("install " + assetName + " failed: " + t);
+            return false;
+        }
     }
 
     private void toast(String text) {
@@ -579,11 +646,20 @@ public class MainActivity extends Activity {
         }
         new Thread(() -> {
             try {
+                if (!installTimerIfNeeded()) {
+                    addLog("cannot run exploit: timer not installed");
+                    return;
+                }
                 String out = service.openRoot();
-                rootOpen = out.contains("uid=0(root)") || out.contains("started");
+                rootOpen = out.contains("uid=0(root)")
+                        || (out.contains("setuid(0)=0") && out.contains("resuid=0/0/"));
                 addLog(out);
                 ui.post(this::applyDetails);
-                if (rootOpen && !"active".equals(ksu)) {
+                if (!rootOpen) {
+                    addLog("root shell was not obtained; KernelSU was not started");
+                    return;
+                }
+                if (!"active".equals(ksu)) {
                     addLog("root shell ready - loading KernelSU...");
                     runKsu();
                 }
@@ -612,6 +688,14 @@ public class MainActivity extends Activity {
         }
         new Thread(() -> {
             try {
+                if (!installTimerIfNeeded()) {
+                    addLog("cannot load KernelSU: timer not installed");
+                    return;
+                }
+                if (!installKsudIfNeeded()) {
+                    addLog("cannot load KernelSU: ksud not installed at " + KSUD_PATH);
+                    return;
+                }
                 addLog(service.runDetached("fake"));
                 final long start = System.currentTimeMillis();
                 boolean loaded = false;
@@ -662,7 +746,11 @@ public class MainActivity extends Activity {
                         refreshDetails();
                     } else {
                         statusTitle.setText("KernelSU failed");
-                        statusSubtitle.setText(reason + " - reboot, then retry");
+                        boolean parked = reason != null && (reason.contains("parked")
+                                || reason.contains("selinux"));
+                        statusSubtitle.setText(parked
+                                ? reason + " - reboot, then retry"
+                                : reason);
                         statusBadge.setText("!");
                         statusBadge.setTextColor(RED);
                         toast("KernelSU failed: " + reason);
@@ -720,6 +808,10 @@ public class MainActivity extends Activity {
         }
         new Thread(() -> {
             try {
+                if (!installTimerIfNeeded()) {
+                    addLog("[" + label + "] timer not installed");
+                    return;
+                }
                 addLog("[" + label + "]\n" + service.run(args));
             } catch (Throwable t) {
                 addLog("[" + label + "] failed: " + t);
@@ -744,7 +836,7 @@ public class MainActivity extends Activity {
                 .daemon(false)
                 .processNameSuffix("timer")
                 .debuggable(false)
-                .version(5);
+                .version(7);
     }
 
     private void copyLog() {

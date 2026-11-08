@@ -25,8 +25,18 @@ import java.util.zip.ZipFile;
 public class UserService extends IUserService.Stub {
 
     private static final String BIN = "/data/local/tmp/timer";
+    /**
+     * Fallback looked up by the exploit script in
+     * CVE-2026-98260 timer/timer.c write_ksu_script(), just before
+     * "[ksu] ksud missing".
+     */
+    private static final String KSUD = "/data/local/tmp/ksud";
     private static final String LOG = "/data/local/tmp/timer.log";
     private static final int MAX_OUTPUT = 20000;
+
+    private FileOutputStream chunkOut;
+    private String chunkDest;
+    private long chunkSize;
 
     private Process rootProcess;
     private BufferedWriter rootInput;
@@ -55,32 +65,126 @@ public class UserService extends IUserService.Stub {
             try (ZipFile zf = new ZipFile(apk)) {
                 ZipEntry entry = zf.getEntry("assets/timer");
                 if (entry == null) {
-                    return "assets/timer not found in " + apk;
+                    return "assets/timer not found in " + apk
+                            + " - use Prepare (reads assets via the app)";
                 }
-                String tmp = BIN + ".new";
-                try (InputStream in = zf.getInputStream(entry);
-                     FileOutputStream out = new FileOutputStream(tmp)) {
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                try (InputStream in = zf.getInputStream(entry)) {
                     byte[] buf = new byte[65536];
                     int n;
                     while ((n = in.read(buf)) > 0) {
-                        out.write(buf, 0, n);
+                        bos.write(buf, 0, n);
                     }
                 }
-                // The old binary may still be mapped by a parked process; rename
-                // over it instead of writing in place (ETXTBSY).
-                Process move = Runtime.getRuntime().exec(new String[]{"/system/bin/sh",
-                        "-c", "chmod 755 " + tmp + " && mv -f " + tmp + " " + BIN});
-                move.waitFor();
+                return installFromBytes(bos.toByteArray());
             }
-            return "installed " + new File(BIN).length() + " bytes (uid="
-                    + android.system.Os.getuid() + ")";
         } catch (Throwable t) {
             return "install failed: " + t;
         }
     }
 
     @Override
+    public String installFromBytes(byte[] payload) {
+        try {
+            return installPayload(BIN, payload);
+        } catch (Throwable t) {
+            return "install failed: " + t;
+        }
+    }
+
+    @Override
+    public String installFileChunk(String dest, int seq, byte[] chunk, boolean last) {
+        if (!BIN.equals(dest) && !KSUD.equals(dest)) {
+            return "install failed: unsupported path " + dest;
+        }
+        if (chunk == null) {
+            chunk = new byte[0];
+        }
+        synchronized (this) {
+            try {
+                if (seq == 0) {
+                    closeChunk();
+                    chunkDest = dest;
+                    chunkSize = 0;
+                    chunkOut = new FileOutputStream(dest + ".new");
+                } else if (chunkOut == null || !dest.equals(chunkDest)) {
+                    return "install failed: chunk out of order for " + dest;
+                }
+                if (chunk.length > 0) {
+                    chunkOut.write(chunk);
+                    chunkSize += chunk.length;
+                }
+                if (!last) {
+                    return "chunk " + chunkSize;
+                }
+                long expected = chunkSize;
+                chunkOut.getFD().sync();
+                closeChunk();
+                return finishInstall(dest, expected);
+            } catch (Throwable t) {
+                closeChunk();
+                return "install failed: " + t;
+            }
+        }
+    }
+
+    private void closeChunk() {
+        if (chunkOut != null) {
+            try {
+                chunkOut.close();
+            } catch (IOException ignored) {
+            }
+            chunkOut = null;
+        }
+    }
+
+    private String installPayload(String dest, byte[] payload)
+            throws IOException, InterruptedException {
+        if (payload == null || payload.length == 0) {
+            return "install failed: empty payload for " + dest;
+        }
+        String tmp = dest + ".new";
+        try (FileOutputStream out = new FileOutputStream(tmp)) {
+            out.write(payload);
+            out.getFD().sync();
+        }
+        return finishInstall(dest, payload.length);
+    }
+
+    private String finishInstall(String dest, long expected)
+            throws IOException, InterruptedException {
+        String tmp = dest + ".new";
+        // The old binary may still be mapped by a parked process; rename
+        // over it instead of writing in place (ETXTBSY).
+        Process move = Runtime.getRuntime().exec(new String[]{"/system/bin/sh",
+                "-c", "chmod 755 " + tmp + " && mv -f " + tmp + " " + dest});
+        int rc = move.waitFor();
+        File bin = new File(dest);
+        if (rc != 0 || !bin.exists() || bin.length() != expected) {
+            return "install failed: chmod/mv rc=" + rc + " size=" + bin.length()
+                    + " expected=" + expected + " dest=" + dest;
+        }
+        if (!bin.canExecute()) {
+            return "install failed: " + dest + " is not executable";
+        }
+        return "installed " + bin.length() + " bytes at " + dest + " (uid="
+                + android.system.Os.getuid() + ")";
+    }
+
+    private String requireBinary() {
+        File bin = new File(BIN);
+        if (!bin.exists() || bin.length() < 1024 || !bin.canExecute()) {
+            return "timer missing at " + BIN + " - open the app and press Prepare first";
+        }
+        return null;
+    }
+
+    @Override
     public String run(String args) {
+        String missing = requireBinary();
+        if (missing != null) {
+            return missing;
+        }
         try {
             ProcessBuilder pb = new ProcessBuilder(
                     "/system/bin/sh", "-c", BIN + " " + args + " 2>&1");
@@ -100,6 +204,10 @@ public class UserService extends IUserService.Stub {
 
     @Override
     public String runDetached(String args) {
+        String missing = requireBinary();
+        if (missing != null) {
+            return missing;
+        }
         try {
             String cmd = "cd /data/local/tmp && setsid " + BIN + " " + args
                     + " >" + LOG + " 2>&1 </dev/null &";
@@ -124,6 +232,10 @@ public class UserService extends IUserService.Stub {
     public String openRoot() {
         if (rootProcess != null && rootProcess.isAlive()) {
             return "root shell already open";
+        }
+        String missing = requireBinary();
+        if (missing != null) {
+            return missing;
         }
         try {
             ProcessBuilder pb = new ProcessBuilder(BIN, "shell");

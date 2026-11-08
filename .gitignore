@@ -9,6 +9,7 @@ local.properties
 
 # the exploit binary is fetched, not committed
 app/src/main/assets/timer
+app/src/main/assets/ksud
 
 # ide
 .idea/
