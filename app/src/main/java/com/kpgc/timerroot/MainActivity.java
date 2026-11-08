@@ -84,6 +84,12 @@ public class MainActivity extends Activity {
     private String ksu = "unknown";
     private String selinux = "-";
     private String seccomp = "-";
+    private String runLog = "";
+    private int runSerial;
+    private int followGeneration;
+    private RootLog.Outcome lastOutcome;
+    private boolean lastAlive;
+    private boolean lastZombies;
 
     private final ServiceConnection connection = new ServiceConnection() {
         @Override
@@ -473,6 +479,16 @@ public class MainActivity extends Activity {
             statusSubtitle.setText("uid=0 · u:r:shell:s0 · gone after reboot");
             statusBadge.setText("✓");
             statusBadge.setTextColor(GREEN);
+        } else if (lastOutcome == RootLog.Outcome.RUNNING
+                || lastOutcome == RootLog.Outcome.INDETERMINATE
+                || lastOutcome == RootLog.Outcome.FAILED) {
+            statusTitle.setText(lastOutcome.name());
+            statusSubtitle.setText("run " + runSerial
+                    + (lastAlive ? " · process still alive" : "")
+                    + (lastZombies ? " · zombie retained" : "")
+                    + " · reboot to clear a retained process");
+            statusBadge.setText(lastOutcome == RootLog.Outcome.FAILED ? "!" : "•");
+            statusBadge.setTextColor(lastOutcome == RootLog.Outcome.FAILED ? RED : MUTED);
         } else if (shizuku && bound) {
             statusTitle.setText("Ready");
             statusSubtitle.setText("Shizuku connected · no root yet");
@@ -644,28 +660,89 @@ public class MainActivity extends Activity {
             addLog("bind the service first");
             return;
         }
+        final int run = ++runSerial;
+        followGeneration = run;
         new Thread(() -> {
             try {
                 if (!installTimerIfNeeded()) {
                     addLog("cannot run exploit: timer not installed");
                     return;
                 }
+                addLog("--- shell run " + run + " ---");
                 String out = service.openRoot();
-                rootOpen = RootLog.shellConfirmed(out);
+                runLog = out == null ? "" : out;
                 addLog(out);
-                ui.post(this::applyDetails);
-                if (!rootOpen) {
+                String observed = service.observe();
+                absorb(observed);
+                RootLog.Outcome outcome = RootLog.classify(
+                        runLog, RootLog.aliveOf(observed), RootLog.zombiesOf(observed));
+                rootOpen = outcome == RootLog.Outcome.SUCCESS;
+                showOutcome(outcome, observed);
+                if (outcome == RootLog.Outcome.SUCCESS) {
+                    if (!"active".equals(ksu)) {
+                        addLog("root shell ready - loading KernelSU...");
+                        runKsu();
+                    }
+                    return;
+                }
+                if (outcome == RootLog.Outcome.RUNNING) {
+                    addLog("UI wait ended; process still running. KernelSU was not started.");
+                    followProcess(run);
+                    return;
+                }
+                if (outcome == RootLog.Outcome.FAILED) {
                     addLog("root shell was not obtained; KernelSU was not started");
                     return;
                 }
-                if (!"active".equals(ksu)) {
-                    addLog("root shell ready - loading KernelSU...");
-                    runKsu();
-                }
+                addLog("state=INDETERMINATE. No error line is not a safe exit. "
+                        + "KernelSU was not started.");
             } catch (Throwable t) {
                 addLog("root failed: " + t);
             }
         }).start();
+    }
+
+    private void absorb(String observed) {
+        String extra = RootLog.outputOf(observed);
+        if (!extra.isEmpty()) {
+            runLog = runLog + "\n" + extra;
+            addLog(extra);
+        }
+    }
+
+    private void followProcess(int run) {
+        new Thread(() -> {
+            while (followGeneration == run) {
+                try {
+                    Thread.sleep(2000);
+                    if (followGeneration != run || service == null) {
+                        return;
+                    }
+                    String observed = service.observe();
+                    absorb(observed);
+                    boolean alive = RootLog.aliveOf(observed);
+                    RootLog.Outcome outcome = RootLog.classify(
+                            runLog, alive, RootLog.zombiesOf(observed));
+                    rootOpen = outcome == RootLog.Outcome.SUCCESS;
+                    showOutcome(outcome, observed);
+                    if (!alive) {
+                        addLog("run " + run + " left the UI wait in state=" + outcome
+                                + ". KernelSU was not started from this follow-up.");
+                        return;
+                    }
+                } catch (Throwable t) {
+                    addLog("follow failed: " + t);
+                    return;
+                }
+            }
+        }).start();
+    }
+
+    private void showOutcome(RootLog.Outcome outcome, String observed) {
+        lastOutcome = outcome;
+        lastAlive = RootLog.aliveOf(observed);
+        lastZombies = RootLog.zombiesOf(observed);
+        ui.post(this::applyDetails);
     }
 
     private void confirmKsu() {
@@ -687,6 +764,10 @@ public class MainActivity extends Activity {
         }
         new Thread(() -> {
             try {
+                if (lastOutcome != RootLog.Outcome.SUCCESS && !rootOpen) {
+                    addLog("KernelSU was not started. This run is not SUCCESS.");
+                    return;
+                }
                 if (!installTimerIfNeeded()) {
                     addLog("cannot load KernelSU: timer not installed");
                     return;
@@ -695,7 +776,10 @@ public class MainActivity extends Activity {
                     addLog("cannot load KernelSU: ksud not installed at " + KSUD_PATH);
                     return;
                 }
-                addLog(service.runDetached("fake"));
+                addLog("--- ksu run " + (++runSerial) + " ---");
+                String started = service.runDetached("fake");
+                runLog = runLog + "\n" + started;
+                addLog(started);
                 final long start = System.currentTimeMillis();
                 boolean loaded = false;
                 String failure = null;
@@ -726,16 +810,15 @@ public class MainActivity extends Activity {
                 if (!loaded && failure == null) {
                     failure = "timed out after 90s";
                 }
-                if (!loaded) {
-                    String tail = service.readLog();
-                    if (tail.contains("base calibration failed")) {
-                        failure = "base calibration failed (memory layout not supported)";
-                    }
+                String tail = service.readLog();
+                runLog = runLog + "\n" + tail;
+                if (!loaded && tail.contains("base calibration failed")) {
+                    failure = "base calibration failed (memory layout not supported)";
                 }
                 if (loaded) {
                     parseInfo(service.info());
                 }
-                addLog(service.readLog());
+                addLog(tail);
                 final boolean ok = loaded;
                 final String reason = failure;
                 ui.post(() -> {
@@ -753,8 +836,9 @@ public class MainActivity extends Activity {
                         statusBadge.setText("!");
                         statusBadge.setTextColor(RED);
                         toast("KernelSU failed: " + reason);
-                        addLog("KernelSU failed: " + reason
-                                + " - parked processes remain; reboot to clean up");
+                        addLog("KernelSU was not confirmed: " + reason
+                                + ". state=INDETERMINATE unless the log shows an explicit failure."
+                                + " Reboot if a process is still retained.");
                     }
                 });
             } catch (Throwable t) {
@@ -767,22 +851,23 @@ public class MainActivity extends Activity {
         if (service == null) {
             return;
         }
-        String seen = logText == null ? "" : logText.getText().toString();
-        if (RootLog.parentMustStay(seen)) {
-            // Experimental containment, not a fix. Leaving the parent alive does
-            // not show that the timer node is intact. Android's Process.destroy()
-            // sends SIGTERM (UNIXProcess_destroyProcess); this path does not call it.
-            addLog("Stop left the timer parent alone. The log shows a held zombie "
-                    + "or a parked process, so cleanup is not complete. "
-                    + "Only a reboot clears that state.");
-            statusTitle.setText("Processes still held");
-            statusSubtitle.setText("Stop did not clean up. Reboot to clear.");
-            statusBadge.setText("!");
-            statusBadge.setTextColor(RED);
-            return;
-        }
         new Thread(() -> {
             try {
+                String observed = service.observe();
+                absorb(observed);
+                boolean alive = RootLog.aliveOf(observed);
+                boolean zombies = RootLog.zombiesOf(observed);
+                if (RootLog.stopBlocked(runLog, alive, zombies)) {
+                    // Not a validated cleanup. Process.destroy() sends SIGTERM;
+                    // this path does not call it while anything is still retained
+                    // or the run never reached an explicit FAILED state.
+                    addLog("Stop sent no signal. state="
+                            + RootLog.classify(runLog, alive, zombies)
+                            + " " + observed.replace('\n', ' ')
+                            + "Only a reboot clears a retained process.");
+                    showOutcome(RootLog.classify(runLog, alive, zombies), observed);
+                    return;
+                }
                 addLog(service.closeRoot());
                 rootOpen = false;
                 ui.post(this::applyDetails);
@@ -846,10 +931,10 @@ public class MainActivity extends Activity {
     private Shizuku.UserServiceArgs serviceArgs() {
         return new Shizuku.UserServiceArgs(
                 new ComponentName(getPackageName(), UserService.class.getName()))
-                .daemon(false)
+                .daemon(true)
                 .processNameSuffix("timer")
                 .debuggable(false)
-                .version(7);
+                .version(8);
     }
 
     private void copyLog() {
