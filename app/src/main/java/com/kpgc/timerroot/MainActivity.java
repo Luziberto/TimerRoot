@@ -767,6 +767,20 @@ public class MainActivity extends Activity {
         if (service == null) {
             return;
         }
+        String seen = logText == null ? "" : logText.getText().toString();
+        if (RootLog.parentMustStay(seen)) {
+            // Experimental containment, not a fix. Leaving the parent alive does
+            // not show that the timer node is intact. Android's Process.destroy()
+            // sends SIGTERM (UNIXProcess_destroyProcess); this path does not call it.
+            addLog("Stop left the timer parent alone. The log shows a held zombie "
+                    + "or a parked process, so cleanup is not complete. "
+                    + "Only a reboot clears that state.");
+            statusTitle.setText("Processes still held");
+            statusSubtitle.setText("Stop did not clean up. Reboot to clear.");
+            statusBadge.setText("!");
+            statusBadge.setTextColor(RED);
+            return;
+        }
         new Thread(() -> {
             try {
                 addLog(service.closeRoot());

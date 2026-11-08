@@ -37,4 +37,13 @@ public class RootLogTest {
     public void nullLogIsNotRoot() {
         assertFalse(RootLog.shellConfirmed(null));
     }
+
+    @Test
+    public void heldZombieMeansParentMustStay() {
+        assertTrue(RootLog.parentMustStay("[-] plant1 burst missed; holding zombie"));
+        assertTrue(RootLog.parentMustStay(
+                "[!] fake cred page held; reboot to clean -- parking without reap (zombie held)"));
+        assertFalse(RootLog.parentMustStay("installed 307384 bytes"));
+        assertFalse(RootLog.parentMustStay(null));
+    }
 }

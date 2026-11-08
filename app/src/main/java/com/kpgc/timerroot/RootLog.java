@@ -17,4 +17,12 @@ final class RootLog {
         return log.contains("uid=0(root)")
                 || (log.contains("setuid(0)=0") && log.contains("resuid=0/0/"));
     }
+
+    /** True when the exploit log says a child was left unreaped or parked. */
+    static boolean parentMustStay(String log) {
+        if (log == null) {
+            return false;
+        }
+        return log.contains("holding zombie") || log.contains("parking without reap");
+    }
 }
