@@ -41,6 +41,9 @@ public class UserService extends IUserService.Stub {
     private Process rootProcess;
     private BufferedWriter rootInput;
     private final BlockingQueue<String> rootLines = new LinkedBlockingQueue<>();
+    /** True only after this service starts a KernelSU run. Ignores an older timer.log. */
+    private boolean runLogOwned;
+    private int detachedPid = -1;
 
     public UserService() {
     }
@@ -50,6 +53,9 @@ public class UserService extends IUserService.Stub {
 
     @Override
     public void destroy() {
+        if (retained()) {
+            return;
+        }
         closeRootInternal();
         System.exit(0);
     }
@@ -209,11 +215,14 @@ public class UserService extends IUserService.Stub {
             return missing;
         }
         try {
-            String cmd = "cd /data/local/tmp && setsid " + BIN + " " + args
-                    + " >" + LOG + " 2>&1 </dev/null &";
-            Runtime.getRuntime().exec(new String[]{"/system/bin/sh", "-c", cmd});
+            String cmd = "mv -f " + LOG + " " + LOG + ".prev >/dev/null 2>&1; "
+                    + "cd /data/local/tmp && setsid " + BIN + " " + args
+                    + " >" + LOG + " 2>&1 </dev/null & echo $!";
+            runLogOwned = true;
+            Process starter = Runtime.getRuntime().exec(new String[]{"/system/bin/sh", "-c", cmd});
+            detachedPid = firstPid(readAll(starter.getInputStream()));
             Thread.sleep(2000);
-            return readLog();
+            return "detached pid=" + detachedPid + "\n" + readLog();
         } catch (Throwable t) {
             return "start failed: " + t;
         }
@@ -221,9 +230,170 @@ public class UserService extends IUserService.Stub {
 
     @Override
     public String readLog() {
+        if (!runLogOwned) {
+            return "";
+        }
         try (FileInputStream in = new FileInputStream(LOG)) {
             return readAll(in);
         } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    @Override
+    public String observe() {
+        int pid = pidOf(rootProcess);
+        boolean alive = rootProcess != null && rootProcess.isAlive();
+        String zombies = zombieChildren(pid);
+        boolean detachedAlive = present(detachedPid);
+        StringBuilder sb = new StringBuilder();
+        sb.append("pid=").append(pid).append('\n');
+        sb.append("alive=").append(alive ? 1 : 0).append('\n');
+        sb.append("zombies=").append(zombies).append('\n');
+        sb.append("detached=").append(detachedPid).append('\n');
+        sb.append("detachedAlive=").append(detachedAlive ? 1 : 0).append('\n');
+        sb.append("detachedZombies=").append(zombieChildren(detachedPid)).append('\n');
+        String line;
+        while ((line = rootLines.poll()) != null) {
+            sb.append("out=").append(line).append('\n');
+        }
+        return sb.toString();
+    }
+
+    private boolean retained() {
+        int pid = pidOf(rootProcess);
+        boolean alive = rootProcess != null && rootProcess.isAlive();
+        return alive || present(detachedPid)
+                || !zombieChildren(pid).isEmpty()
+                || !zombieChildren(detachedPid).isEmpty();
+    }
+
+    private static int firstPid(String text) {
+        if (text == null) {
+            return -1;
+        }
+        java.util.regex.Matcher matcher = Pattern.compile("(\\d+)").matcher(text);
+        if (!matcher.find()) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(matcher.group(1));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private static boolean present(int pid) {
+        if (pid <= 0) {
+            return false;
+        }
+        String status = readSmall(new File("/proc/" + pid + "/status"), 200);
+        String name = nameField(status);
+        return "timer".equals(name) || "exe".equals(name);
+    }
+
+    private static String nameField(String status) {
+        int at = status.indexOf("Name:");
+        if (at < 0) {
+            return "";
+        }
+        int i = at + "Name:".length();
+        while (i < status.length() && (status.charAt(i) == ' ' || status.charAt(i) == '\t')) {
+            i++;
+        }
+        int end = i;
+        while (end < status.length() && !Character.isWhitespace(status.charAt(end))) {
+            end++;
+        }
+        return status.substring(i, end);
+    }
+
+    private static int pidOf(Process process) {
+        if (process == null) {
+            return -1;
+        }
+        java.util.regex.Matcher matcher = Pattern.compile("pid=(\\d+)")
+                .matcher(process.toString());
+        if (!matcher.find()) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(matcher.group(1));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private static String zombieChildren(int pid) {
+        if (pid <= 0) {
+            return "";
+        }
+        File[] entries = new File("/proc").listFiles();
+        if (entries == null) {
+            return "";
+        }
+        StringBuilder zombies = new StringBuilder();
+        for (File entry : entries) {
+            int child;
+            try {
+                child = Integer.parseInt(entry.getName());
+            } catch (NumberFormatException ignored) {
+                continue;
+            }
+            String status = readSmall(new File(entry, "status"), 400);
+            if (!status.startsWith("Name:") && !status.contains("Name:")) {
+                continue;
+            }
+            int ppid = statusField(status, "PPid:");
+            String state = stateField(status);
+            if (ppid == pid && state.startsWith("Z")) {
+                if (zombies.length() > 0) {
+                    zombies.append(',');
+                }
+                zombies.append(child);
+            }
+        }
+        return zombies.toString();
+    }
+
+    private static int statusField(String status, String key) {
+        int at = status.indexOf(key);
+        if (at < 0) {
+            return -1;
+        }
+        int i = at + key.length();
+        while (i < status.length() && (status.charAt(i) == ' ' || status.charAt(i) == '\t')) {
+            i++;
+        }
+        int end = i;
+        while (end < status.length() && Character.isDigit(status.charAt(end))) {
+            end++;
+        }
+        try {
+            return Integer.parseInt(status.substring(i, end));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private static String stateField(String status) {
+        int at = status.indexOf("State:");
+        if (at < 0) {
+            return "";
+        }
+        int i = at + "State:".length();
+        while (i < status.length() && (status.charAt(i) == ' ' || status.charAt(i) == '\t')) {
+            i++;
+        }
+        return i < status.length() ? status.substring(i, i + 1) : "";
+    }
+
+    private static String readSmall(File file, int max) {
+        try (FileInputStream in = new FileInputStream(file)) {
+            byte[] buf = new byte[max];
+            int n = in.read(buf);
+            return n > 0 ? new String(buf, 0, n, "UTF-8") : "";
+        } catch (IOException e) {
             return "";
         }
     }
@@ -305,6 +475,11 @@ public class UserService extends IUserService.Stub {
 
     @Override
     public String closeRoot() {
+        if (retained()) {
+            return "close refused: pid " + pidOf(rootProcess)
+                    + " detached " + detachedPid
+                    + " still retained. Reboot to clear. No signal was sent.";
+        }
         closeRootInternal();
         return "root shell closed";
     }

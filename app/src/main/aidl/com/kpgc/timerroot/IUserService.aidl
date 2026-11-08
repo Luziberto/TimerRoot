@@ -15,4 +15,6 @@ interface IUserService {
     String installFromBytes(in byte[] payload) = 11;
     /** seq 0 starts dest+".new"; last chunk chmod 755 and renames onto dest. */
     String installFileChunk(String dest, int seq, in byte[] chunk, boolean last) = 12;
+    /** pid, alive, unreaped child zombies, and stdout lines since the last call. */
+    String observe() = 13;
 }
