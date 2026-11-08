@@ -236,4 +236,11 @@ scripts/build.ps1                                        Gradle-free build
 ## License
 
 MIT for the app code in this repository. The exploit binary and the Shizuku API
-keep their own licenses.
+keep their own licenses. KernelSU is GPL-2.0. Do not commit `assets/timer` or
+`assets/ksud`; check those licenses before publishing either binary.
+
+## Experimental
+
+[docs/EXPERIMENTAL.md](docs/EXPERIMENTAL.md) is one ColorOS 17 session on an
+OnePlus 15. It is not a compatibility claim and not a request to track other
+devices.
